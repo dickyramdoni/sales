@@ -6,6 +6,7 @@
 <title>SalesPro — Dashboard Tim Sales & Marketing</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.5.0/sql-wasm.js"></script>
 <style>
 :root {
   --bg:#0a0c10; --surface:#111318; --surface2:#181b22; --surface3:#1e2230;
@@ -345,6 +346,12 @@ body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min
 </style>
 </head>
 <body>
+<div id="dbStatusWidget" style="position:fixed;bottom:14px;right:14px;z-index:500;background:#111318;border:1px solid rgba(255,255,255,0.07);border-radius:9px;padding:8px 10px 8px 12px;font-size:11px;color:#9ca3af;display:flex;align-items:center;gap:8px;box-shadow:0 4px 16px rgba(0,0,0,0.35);font-family:'DM Sans',sans-serif;">
+  <span id="dbStatusDot" style="width:7px;height:7px;border-radius:50%;background:#fbbf24;flex-shrink:0;"></span>
+  <span id="dbStatusText">Memuat database…</span>
+  <button onclick="downloadSqliteFile()" title="Unduh backup .sqlite" style="width:24px;height:24px;flex-shrink:0;border-radius:6px;background:transparent;border:1px solid rgba(255,255,255,0.07);color:#9ca3af;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;">⭳</button>
+  <label title="Pulihkan dari file .sqlite backup" style="width:24px;height:24px;flex-shrink:0;border-radius:6px;background:transparent;border:1px solid rgba(255,255,255,0.07);color:#9ca3af;cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;">⭱<input type="file" accept=".sqlite,.db" style="display:none" onchange="restoreSqliteFile(event)"></label>
+</div>
 
 <!-- SIDEBAR -->
 <aside class="sidebar">
@@ -3775,28 +3782,244 @@ function refreshBizChart(){
   renderBusinessChart(activeBizChart);
 }
 
+// ==================== SQLITE PERSISTENCE LAYER ====================
+// Semua data (deals, customers, contracts, tasks, salespeople, products,
+// warehouses, stockMoves, suspendData) disimpan sebagai database SQLite
+// nyata (via sql.js/WebAssembly) yang di-export ke bytes dan disimpan di
+// IndexedDB browser, sehingga bertahan walau halaman di-refresh atau
+// browser ditutup. Tombol ⭳/⭱ di pojok kanan bawah untuk backup/restore
+// file .sqlite secara manual.
+let db = null;
+let persistTimer = null;
+const IDB_NAME = 'salesProSqliteDB';
+const IDB_STORE = 'files';
+const IDB_KEY = 'mainDb';
+
+const DB_TABLES = {
+  deals: () => deals,
+  customers: () => customers,
+  contracts: () => contracts,
+  tasks: () => tasks,
+  salespeople: () => salespeople,
+  products: () => products,
+  warehouses: () => warehouses,
+  stock_moves: () => stockMoves,
+  suspend_data: () => suspendData,
+};
+
+function setDbStatus(text, color) {
+  const t = document.getElementById('dbStatusText');
+  const d = document.getElementById('dbStatusDot');
+  if (t) t.textContent = text;
+  if (d) d.style.background = color;
+}
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(IDB_STORE); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbGetDB() {
+  try {
+    const conn = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = conn.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (e) { console.error('IndexedDB read error', e); return null; }
+}
+async function idbSetDB(bytes) {
+  try {
+    const conn = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = conn.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(bytes, IDB_KEY);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (e) { console.error('IndexedDB write error', e); return false; }
+}
+
+function createSchema() {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS deals (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS contracts (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS salespeople (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS warehouses (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS stock_moves (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS suspend_data (id INTEGER PRIMARY KEY, data TEXT);
+    CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+  `);
+}
+
+function loadArraysFromDb() {
+  function loadTable(t, arr) {
+    const res = db.exec('SELECT data FROM ' + t + ' ORDER BY id');
+    arr.length = 0;
+    if (res.length) res[0].values.forEach(row => { try { arr.push(JSON.parse(row[0])); } catch (e) {} });
+  }
+  loadTable('deals', deals);
+  loadTable('customers', customers);
+  loadTable('contracts', contracts);
+  loadTable('tasks', tasks);
+  loadTable('salespeople', salespeople);
+  loadTable('products', products);
+  loadTable('warehouses', warehouses);
+  loadTable('stock_moves', stockMoves);
+  loadTable('suspend_data', suspendData);
+
+  const metaRes = db.exec('SELECT key,value FROM meta');
+  const metaMap = {};
+  if (metaRes.length) metaRes[0].values.forEach(([k, v]) => metaMap[k] = parseInt(v) || 0);
+  const maxId = arr => arr.length ? Math.max(...arr.map(x => x.id || 0)) + 1 : 1;
+  nDeal = metaMap.nDeal || maxId(deals);
+  nCust = metaMap.nCust || maxId(customers);
+  nContract = metaMap.nContract || maxId(contracts);
+  nTask = metaMap.nTask || maxId(tasks);
+  nSales = metaMap.nSales || maxId(salespeople);
+  nProduct = metaMap.nProduct || maxId(products);
+  nWarehouse = metaMap.nWarehouse || maxId(warehouses);
+  nStockMove = metaMap.nStockMove || maxId(stockMoves);
+  nSuspend = metaMap.nSuspend || maxId(suspendData);
+}
+
+function persistNow() {
+  if (!db) return;
+  try {
+    Object.keys(DB_TABLES).forEach(t => {
+      db.run('DELETE FROM ' + t);
+      const stmt = db.prepare('INSERT INTO ' + t + ' (id,data) VALUES (?,?)');
+      DB_TABLES[t]().forEach(row => stmt.run([row.id, JSON.stringify(row)]));
+      stmt.free();
+    });
+    const meta = { nDeal, nCust, nContract, nTask, nSales, nProduct, nWarehouse, nStockMove, nSuspend };
+    const metaStmt = db.prepare('INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)');
+    Object.keys(meta).forEach(k => metaStmt.run([k, String(meta[k])]));
+    metaStmt.free();
+    const bytes = db.export();
+    setDbStatus('Menyimpan…', '#00e5a0');
+    idbSetDB(bytes).then(ok => {
+      setDbStatus(ok ? 'Tersimpan • ' + new Date().toLocaleTimeString('id-ID') : 'Gagal menyimpan', ok ? '#00e5a0' : '#ff4d6d');
+    });
+  } catch (err) {
+    console.error('Gagal menyimpan data ke SQLite:', err);
+    setDbStatus('Gagal menyimpan', '#ff4d6d');
+  }
+}
+function schedulePersist() {
+  if (!db) return;
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(persistNow, 350);
+}
+
+// Bungkus semua fungsi render entitas: setiap kali data berubah dan
+// halaman dirender ulang, otomatis jadwalkan penyimpanan ke SQLite.
+['renderKanban','renderCustomers','renderContracts','renderTasks','renderSalesTeam',
+ 'renderProducts','renderWarehouses','renderStockPage','renderWarehouseDashboard','renderSuspend']
+.forEach(fnName => {
+  const orig = window[fnName];
+  if (typeof orig !== 'function') return;
+  window[fnName] = function (...args) {
+    const r = orig.apply(this, args);
+    schedulePersist();
+    return r;
+  };
+});
+
+// Backup manual: unduh file .sqlite
+function downloadSqliteFile() {
+  if (!db) { showToast('Database belum siap', 'warn'); return; }
+  persistNow();
+  const bytes = db.export();
+  const blob = new Blob([bytes], { type: 'application/x-sqlite3' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'salespro-backup-' + new Date().toISOString().slice(0, 10) + '.sqlite';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+  showToast('Backup .sqlite diunduh');
+}
+// Restore manual: pulihkan dari file .sqlite yang diunggah
+async function restoreSqliteFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  try {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    const SQL = await window._SQLPromise;
+    db = new SQL.Database(buf);
+    createSchema();
+    loadArraysFromDb();
+    renderKanban(); renderCustomers(); renderContracts(); renderTasks();
+    renderSalesTeam(); rebuildSalesDropdowns(); rebuildCustomerDropdowns();
+    rebuildStockDropdowns(); renderProducts(); renderWarehouses();
+    renderStockPage(); renderWarehouseDashboard(); renderSuspend(); updateCounters();
+    renderDashboardChart(activeChart); renderSalesTargetMini(); refreshBizChart();
+    persistNow();
+    showToast('Database berhasil dipulihkan dari backup');
+  } catch (err) {
+    console.error(err);
+    showToast('Gagal memulihkan file .sqlite ini', 'warn');
+  } finally {
+    event.target.value = '';
+  }
+}
+
+async function initPersistence() {
+  try {
+    window._SQLPromise = initSqlJs({ locateFile: f => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.5.0/${f}` });
+    const SQL = await window._SQLPromise;
+    const savedBytes = await idbGetDB();
+    if (savedBytes) {
+      db = new SQL.Database(new Uint8Array(savedBytes));
+      createSchema();
+      loadArraysFromDb();
+      setDbStatus('Dimuat dari database tersimpan', '#00e5a0');
+    } else {
+      db = new SQL.Database();
+      createSchema();
+      persistNow();
+      setDbStatus('Database SQLite baru dibuat', '#00e5a0');
+    }
+  } catch (err) {
+    console.error('Gagal memuat SQLite, data tidak akan tersimpan permanen:', err);
+    setDbStatus('Penyimpanan tidak tersedia', '#ff4d6d');
+  }
+}
+
 // ==================== INIT ====================
-renderKanban();
-renderCustomers();
-renderContracts();
-renderTasks();
-renderWeekly();
-renderSalesTeam();
-rebuildSalesDropdowns();
-rebuildCustomerDropdowns();
-rebuildStockDropdowns();
-renderProducts();
-renderWarehouses();
-renderStockPage();
-renderWarehouseDashboard();
-renderSuspend();
-updateCounters();
-// Render dashboard charts after layout is ready
-setTimeout(() => {
-  renderDashboardChart('sales');
-  renderSalesTargetMini();
-  renderBusinessChart('pipeline');
-}, 50);
+(async function initApp() {
+  await initPersistence();
+  renderKanban();
+  renderCustomers();
+  renderContracts();
+  renderTasks();
+  renderWeekly();
+  renderSalesTeam();
+  rebuildSalesDropdowns();
+  rebuildCustomerDropdowns();
+  rebuildStockDropdowns();
+  renderProducts();
+  renderWarehouses();
+  renderStockPage();
+  renderWarehouseDashboard();
+  renderSuspend();
+  updateCounters();
+  // Render dashboard charts after layout is ready
+  setTimeout(() => {
+    renderDashboardChart('sales');
+    renderSalesTargetMini();
+    renderBusinessChart('pipeline');
+  }, 50);
+})();
 </script>
 </body>
 </html>
